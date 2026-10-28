@@ -547,6 +547,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* skip_audio        */ false,
     };
     return params;
 }
@@ -654,6 +655,7 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+            /* skip_audio        */ ctx_params.skip_audio,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);

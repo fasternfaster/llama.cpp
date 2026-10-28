@@ -132,6 +132,10 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // BindX: do not load the audio encoder even when the mmproj carries one (default: false).
+    // Skips the gemma4a CLIP init (tensor upload, graph reserve) for callers with no audio input.
+    bool skip_audio;
 };
 
 MTMD_API const char * mtmd_default_marker(void);

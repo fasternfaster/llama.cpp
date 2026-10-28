@@ -60,6 +60,7 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    bool skip_audio; // BindX: never create the audio context, even if the file has audio tensors
 };
 
 struct clip_init_result {
