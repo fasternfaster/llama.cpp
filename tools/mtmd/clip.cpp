@@ -26,6 +26,7 @@
 #include <array>
 #include <functional>
 #include <float.h>
+#include <chrono>
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
@@ -158,6 +159,10 @@ struct clip_ctx {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
+    // Quantized feedback table that OpenCL get_rows cannot read. Kept on the CPU
+    // so a speech frame does not copy the whole table off the GPU.
+    ggml_context_ptr ctx_host_rows;
+    ggml_backend_buffer_ptr buf_host_rows;
 
 
     int max_nodes = 8192;
@@ -169,6 +174,9 @@ struct clip_ctx {
 
     // for measuring memory usage
     bool no_alloc = false;
+    bool skip_gen_depthformer = false;
+    bool gen_depth_external = false;
+    size_t gen_depth_skipped_bytes = 0;
     std::map<ggml_backend_dev_t, size_t> mem_usage;
     std::map<ggml_backend_dev_t, size_t> mem_compute;
 
@@ -177,6 +185,7 @@ struct clip_ctx {
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
+        skip_gen_depthformer = ctx_params.skip_gen_depthformer;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -1203,7 +1212,8 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
         case PROJECTOR_TYPE_LFM3A_GEN:
             {
                 const auto    gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
-                const int64_t n_cb        = ctx->model.gen_code_embd_w->ne[2];
+                const int64_t n_cb        = ctx->model.hparams.gen_code_n_cb;
+                GGML_ASSERT(n_cb > 0);
                 bool all_known = false;
                 int  n_frames  = 1;
                 if (params && params->codes) {
@@ -2480,6 +2490,7 @@ struct clip_model_loader {
         auto & hparams = model.hparams;
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
+        std::vector<ggml_tensor *> host_rows_to_load;
 
         auto fin = open_ifstream_binary(fname);
         if (!fin) {
@@ -2490,6 +2501,10 @@ struct clip_model_loader {
         const char * prefix = model.modality == CLIP_MODALITY_AUDIO ? "a"
                              : model.modality == CLIP_MODALITY_GEN_AUDIO ? "a.gen.code"
                              : "v";
+        // The NPU file already holds these weights. Unified RAM, so a second copy is wasted.
+        const bool skip_lfm_depth = ctx_clip.skip_gen_depthformer
+            && model.modality == CLIP_MODALITY_GEN_AUDIO
+            && model.proj_type == PROJECTOR_TYPE_LFM3A_GEN;
 
         // get offsets
         for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
@@ -2529,6 +2544,40 @@ struct clip_model_loader {
                 ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
             }
             return cur;
+        };
+
+        // OpenCL get_rows implements f32, f16, and i32. Any other type of this table is
+        // evaluated on the CPU, and a GPU-resident copy is transferred back every frame.
+        auto get_rows_tensor = [&](const std::string & name) {
+            ggml_tensor * meta = ggml_get_tensor(ctx_meta.get(), name.c_str());
+            if (!meta) {
+                throw std::runtime_error(string_format("%s: unable to find tensor %s\n", __func__, name.c_str()));
+            }
+            const bool rows_on_opencl = meta->type == GGML_TYPE_F32 || meta->type == GGML_TYPE_F16 || meta->type == GGML_TYPE_I32;
+            if (rows_on_opencl || ctx_clip.backend == ctx_clip.backend_cpu) {
+                return get_tensor(name);
+            }
+            if (loaded_tensor_names.count(name)) {
+                throw std::runtime_error(string_format("%s: tensor already loaded: %s\n", __func__, name.c_str()));
+            }
+            if (!ctx_clip.ctx_host_rows) {
+                ggml_init_params host_params = {
+                    /*.mem_size   =*/ 4 * ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ctx_clip.ctx_host_rows.reset(ggml_init(host_params));
+                if (!ctx_clip.ctx_host_rows) {
+                    throw std::runtime_error(string_format("%s: failed to init host row context\n", __func__));
+                }
+            }
+            ggml_tensor * data_tensor = ggml_dup_tensor(ctx_clip.ctx_host_rows.get(), meta);
+            ggml_set_name(data_tensor, meta->name);
+            loaded_tensor_names.insert(name);
+            host_rows_to_load.push_back(data_tensor);
+            LOG_INF("%s: %s (%s, %.2f MiB) stays on CPU for get_rows\n",
+                    __func__, name.c_str(), ggml_type_name(meta->type), ggml_nbytes(meta) / 1024.0 / 1024.0);
+            return data_tensor;
         };
 
         // pocket-tts: the encoder and the decoder share the same layout, only the prefix differs
@@ -2600,11 +2649,13 @@ struct clip_model_loader {
 
         model.class_embedding = get_tensor(TN_CLASS_EMBD, false);
 
-        model.pre_ln_w = get_tensor(string_format(TN_LN_PRE, prefix, "weight"), false);
-        model.pre_ln_b = get_tensor(string_format(TN_LN_PRE, prefix, "bias"),   false);
+        if (!skip_lfm_depth) {
+            model.pre_ln_w = get_tensor(string_format(TN_LN_PRE, prefix, "weight"), false);
+            model.pre_ln_b = get_tensor(string_format(TN_LN_PRE, prefix, "bias"),   false);
 
-        model.post_ln_w = get_tensor(string_format(TN_LN_POST, prefix, "weight"), false);
-        model.post_ln_b = get_tensor(string_format(TN_LN_POST, prefix, "bias"),   false);
+            model.post_ln_w = get_tensor(string_format(TN_LN_POST, prefix, "weight"), false);
+            model.post_ln_b = get_tensor(string_format(TN_LN_POST, prefix, "bias"),   false);
+        }
 
         model.patch_bias = get_tensor(TN_PATCH_BIAS, false);
         model.patch_embeddings_0 = get_tensor(TN_PATCH_EMBD,   false);
@@ -2613,17 +2664,20 @@ struct clip_model_loader {
         model.norm_embd_w = get_tensor(string_format(TN_NORM_EMBD, "weight"), false);
         model.norm_embd_b = get_tensor(string_format(TN_NORM_EMBD, "bias"),   false);
 
-        model.position_embeddings = get_tensor(string_format(TN_POS_EMBD, prefix), false);
+        if (!skip_lfm_depth) {
+            model.position_embeddings = get_tensor(string_format(TN_POS_EMBD, prefix), false);
 
-        // lfm3vl
-        model.lfm3vl_embedding_norm_w = get_tensor(string_format(TN_LFM3VL_EMBEDDING_NORM, prefix, "weight"), false);
+            // lfm3vl
+            model.lfm3vl_embedding_norm_w = get_tensor(string_format(TN_LFM3VL_EMBEDDING_NORM, prefix, "weight"), false);
+        }
 
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
             model.proj_type != PROJECTOR_TYPE_QWEN3TTS_SPKENC &&
             model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN &&
             model.proj_type != PROJECTOR_TYPE_SOPRANO &&
-            model.proj_type != PROJECTOR_TYPE_MUSE_SPARK_AUDIO);
+            model.proj_type != PROJECTOR_TYPE_MUSE_SPARK_AUDIO
+        ) && !skip_lfm_depth;
 
         // layers
         const int n_layers_to_load = has_standard_layers ? hparams.n_layer : 0;
@@ -3504,17 +3558,43 @@ struct clip_model_loader {
                 } break;
             case PROJECTOR_TYPE_LFM3A_GEN:
                 {
-                    // depthformer, the generic loop above loaded the a.gen.code.blk.* tensors
-                    for (int il = 0; il < hparams.n_layer; ++il) {
-                        model.layers[il].attn_gate_w = get_tensor(string_format(TN_ATTN_GATE, prefix, il, "weight"));
+                    // [n_embd, n_vocab, n_codebooks]. The all-known feedback path only needs this shape.
+                    ggml_tensor * embd_meta = ggml_get_tensor(ctx_meta.get(), "a.gen.code.embd.weight");
+                    if (embd_meta == nullptr || embd_meta->ne[1] <= 0 || embd_meta->ne[2] <= 0) {
+                        throw std::runtime_error(string_format("%s: a.gen.code.embd.weight is missing\n", __func__));
                     }
-                    model.gen_code_proj_in_w   = get_tensor(string_format(TN_A_GEN_CODE_PROJ_IN,   "weight"));
-                    model.gen_code_proj_in_b   = get_tensor(string_format(TN_A_GEN_CODE_PROJ_IN,   "bias"));
-                    model.gen_code_embd_w      = get_tensor(string_format(TN_A_GEN_CODE_EMBD,      "weight")); // tied head
-                    model.gen_code_out_embd_w  = get_tensor(string_format(TN_A_GEN_CODE_OUT_EMBD,  "weight"));
-                    model.gen_code_norm_w      = get_tensor(string_format(TN_A_GEN_CODE_NORM,      "weight"));
-                    model.gen_code_head_norm_w = get_tensor(string_format(TN_A_GEN_CODE_HEAD_NORM, "weight"));
-                    model.gen_code_mask_embd   = get_tensor(TN_A_GEN_CODE_MASK_EMBD);
+                    hparams.gen_code_n_vocab = (int32_t) embd_meta->ne[1];
+                    hparams.gen_code_n_cb    = (int32_t) embd_meta->ne[2];
+
+                    if (skip_lfm_depth) {
+                        size_t skipped = 0;
+                        for (const auto & kv : tensor_offset) {
+                            const std::string & name = kv.first;
+                            if (name.rfind("a.gen.code.", 0) != 0 || name == "a.gen.code.out_embd.weight") {
+                                continue;
+                            }
+                            ggml_tensor * t = ggml_get_tensor(ctx_meta.get(), name.c_str());
+                            if (t) {
+                                skipped += ggml_nbytes(t);
+                            }
+                        }
+                        ctx_clip.gen_depth_external = true;
+                        ctx_clip.gen_depth_skipped_bytes = skipped;
+                        LOG_INF("%s: LFM3 depthformer stays in the NPU file, skipped %.2f MiB of mmproj tensors\n",
+                                __func__, skipped / (1024.0 * 1024.0));
+                    } else {
+                        // depthformer, the generic loop above loaded the a.gen.code.blk.* tensors
+                        for (int il = 0; il < hparams.n_layer; ++il) {
+                            model.layers[il].attn_gate_w = get_tensor(string_format(TN_ATTN_GATE, prefix, il, "weight"));
+                        }
+                        model.gen_code_proj_in_w   = get_tensor(string_format(TN_A_GEN_CODE_PROJ_IN,   "weight"));
+                        model.gen_code_proj_in_b   = get_tensor(string_format(TN_A_GEN_CODE_PROJ_IN,   "bias"));
+                        model.gen_code_embd_w      = get_tensor(string_format(TN_A_GEN_CODE_EMBD,      "weight")); // tied head
+                        model.gen_code_norm_w      = get_tensor(string_format(TN_A_GEN_CODE_NORM,      "weight"));
+                        model.gen_code_head_norm_w = get_tensor(string_format(TN_A_GEN_CODE_HEAD_NORM, "weight"));
+                        model.gen_code_mask_embd   = get_tensor(TN_A_GEN_CODE_MASK_EMBD);
+                    }
+                    model.gen_code_out_embd_w  = get_rows_tensor(string_format(TN_A_GEN_CODE_OUT_EMBD, "weight"));
 
                     // codec decoder: FSQ level table, one projection over all codebooks, LFM3 decoder -> polar STFT frames
                     auto & c2w = model.c2w;
@@ -4244,6 +4324,29 @@ struct clip_model_loader {
                     }
                 }
                 LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
+                if (!host_rows_to_load.empty()) {
+                    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(ctx_clip.backend_cpu);
+                    ctx_clip.buf_host_rows.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_host_rows.get(), cpu_buft));
+                    if (!ctx_clip.buf_host_rows) {
+                        throw std::runtime_error(string_format("%s: failed to allocate host row buffer\n", __func__));
+                    }
+                    for (ggml_tensor * cur : host_rows_to_load) {
+                        auto it_off = tensor_offset.find(cur->name);
+                        GGML_ASSERT(it_off != tensor_offset.end() && "no offset for host row tensor");
+                        fin.clear();
+                        fin.seekg(it_off->second, std::ios::beg);
+                        if (!fin) {
+                            throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, cur->name));
+                        }
+                        const size_t num_bytes = ggml_nbytes(cur);
+                        read_buf.resize(num_bytes);
+                        fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
+                        if (!fin) {
+                            throw std::runtime_error(string_format("%s: failed to read tensor %s\n", __func__, cur->name));
+                        }
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
+                    }
+                }
             } else {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
@@ -4304,13 +4407,13 @@ struct clip_model_loader {
         warmup(ctx_clip, batch);
     }
 
-    static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
+    static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch, const clip_encode_params * params = nullptr) {
         support_info_graph info;
 
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
             // try to enable flash attention to see if it's supported
             ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
-            info = reserve_compute_meta(ctx_clip, batch);
+            info = reserve_compute_meta(ctx_clip, batch, params);
             if (!info.fattn && info.fattn_op) {
                 auto op = info.fattn_op;
                 LOG_WRN("%s: *****************************************************************\n", __func__);
@@ -4329,10 +4432,10 @@ struct clip_model_loader {
                 LOG_WRN("%s: please report this on github as an issue\n", __func__);
                 LOG_WRN("%s: *****************************************************************\n", __func__);
                 ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
-                reserve_compute_meta(ctx_clip, batch);
+                reserve_compute_meta(ctx_clip, batch, params);
             }
         } else {
-            info = reserve_compute_meta(ctx_clip, batch);
+            info = reserve_compute_meta(ctx_clip, batch, params);
             if (!info.fattn && ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
                 LOG_WRN("%s: flash attention is not supported by the current backend; falling back to CPU (performance will be degraded)\n", __func__);
             }
@@ -4372,8 +4475,8 @@ struct clip_model_loader {
     }
 
     // only initialize backend buffers, but do not allocate them yet
-    static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
-        ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
+    static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch, const clip_encode_params * params = nullptr) {
+        ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch, params)->build();
         ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
 
         ctx_clip.mem_compute.clear();
@@ -4603,7 +4706,11 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         }
 
         if (loader.has_gen_audio) {
-            ctx_gen_audio = new clip_ctx(ctx_params);
+            // Codec and feedback weights are allocated with this context. The depthformer blocks
+            // stay out when skip_gen_depthformer is set, because the NPU file already holds them.
+            clip_context_params gen_params = ctx_params;
+            gen_params.use_gpu = ctx_params.gen_audio_use_gpu;
+            ctx_gen_audio = new clip_ctx(gen_params);
             loader.load_hparams(ctx_gen_audio->model, CLIP_MODALITY_GEN_AUDIO);
             // TODO: CUDA has no flash attention kernel for the depthformer head dim 32, enable it once it does
             if (ctx_gen_audio->model.proj_type == PROJECTOR_TYPE_LFM3A_GEN && ctx_gen_audio->flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
@@ -5215,6 +5322,35 @@ void clip_enc_state_free(clip_enc_state * state) {
     delete state;
 }
 
+namespace {
+struct clip_gen_stage_slot {
+    mtmd_gen_stage_us us;
+    bool valid = false;
+};
+
+thread_local clip_gen_stage_slot g_clip_gen_stage;
+
+int64_t clip_mono_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}
+
+bool clip_gen_stage_take(struct mtmd_gen_stage_us * out) {
+    if (out == nullptr || !g_clip_gen_stage.valid) {
+        return false;
+    }
+    *out = g_clip_gen_stage.us;
+    g_clip_gen_stage.valid = false;
+    return true;
+}
+
+void clip_gen_stage_set_istft(int64_t istft_us) {
+    if (g_clip_gen_stage.valid) {
+        g_clip_gen_stage.us.istft_us = istft_us;
+    }
+}
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
@@ -5225,14 +5361,30 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         return false;
     }
 
-    // if buffers are not allocated, we need to do a warmup run to allocate them
+    // if buffers are not allocated, we need to do a warmup run to allocate them.
+    // Pass this call's params: a gen-audio measure with no codes builds the depthformer,
+    // and those weights are not resident when the NPU file holds them.
     if (!ctx->is_allocated) {
-        clip_model_loader::warmup(*ctx, *params->imgs);
+        clip_model_loader::warmup(*ctx, *params->imgs, params);
     }
 
     if (params->gen_process != CLIP_GEN_PROCESS_GEN_UNKNOWN && params->gen_state == nullptr) {
         LOG_ERR("%s: audio gen requires a gen state\n", __func__);
         return false;
+    }
+
+    // LFM3 speech-out rebuilds this graph on every pass. The clocks split that
+    // rebuild from input upload, host submit, the scheduler's existing queue
+    // wait, and the copy. Other projectors keep the single compute call.
+    const bool stage_on = ctx->model.proj_type == PROJECTOR_TYPE_LFM3A_GEN
+        && params->gen_process != CLIP_GEN_PROCESS_GEN_UNKNOWN;
+    int64_t t_build0 = 0;
+    int64_t t_prep0 = 0;
+    int64_t t_enq0 = 0;
+    int64_t t_enq1 = 0;
+    int64_t t_wait1 = 0;
+    if (stage_on) {
+        t_build0 = clip_mono_us();
     }
 
     // build the inference graph
@@ -5246,6 +5398,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
         LOG_ERR("%s: failed to allocate compute graph\n", __func__);
         return false;
+    }
+    if (stage_on) {
+        t_prep0 = clip_mono_us();
     }
 
     // set inputs
@@ -6220,8 +6375,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             } break;
         case PROJECTOR_TYPE_LFM3A_GEN:
             {
-                const int64_t n_cb    = model.gen_code_embd_w->ne[2];
-                const int64_t n_vocab = model.gen_code_embd_w->ne[1];
+                const int64_t n_cb    = hparams.gen_code_n_cb;
+                const int64_t n_vocab = hparams.gen_code_n_vocab;
+                GGML_ASSERT(n_cb > 0 && n_vocab > 0);
                 if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
                     GGML_ASSERT(params->codes != nullptr);
                     // codes index the FSQ table via ggml_get_rows, the end-of-audio code has no waveform
@@ -6771,7 +6927,19 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
 
-    auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    ggml_status status;
+    if (stage_on) {
+        // Same two steps as ggml_backend_sched_graph_compute. The async call
+        // returns after submit; synchronize is the one barrier wait already
+        // inside that function. Splitting them adds no second wait.
+        t_enq0 = clip_mono_us();
+        status = ggml_backend_sched_graph_compute_async(ctx->sched.get(), gf);
+        t_enq1 = clip_mono_us();
+        ggml_backend_sched_synchronize(ctx->sched.get());
+        t_wait1 = clip_mono_us();
+    } else {
+        status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
@@ -6889,6 +7057,24 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             GGML_ASSERT(i < slots.size());
             copy_gen_state_out(t, slots[i++]);
         }
+    }
+
+    if (stage_on) {
+        const int64_t t_read1 = clip_mono_us();
+        mtmd_gen_stage_us s = {};
+        s.build_us = t_prep0 - t_build0;
+        s.prep_us  = t_enq0 - t_prep0;
+        s.enq_us   = t_enq1 - t_enq0;
+        s.gpu_us   = t_wait1 - t_enq1;
+        s.read_us  = t_read1 - t_wait1;
+        s.istft_us = 0;
+        if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+            s.kind = 3;
+        } else {
+            s.kind = ggml_graph_get_tensor(gf, "out_feats") != nullptr ? 1 : 2;
+        }
+        g_clip_gen_stage.us = s;
+        g_clip_gen_stage.valid = true;
     }
 
     //
@@ -7118,6 +7304,14 @@ projector_type clip_get_projector_type(const struct clip_ctx * ctx) {
 
 const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx) {
     return &ctx->model.hparams;
+}
+
+size_t clip_gen_depth_skipped_bytes(const struct clip_ctx * ctx) {
+    return ctx ? ctx->gen_depth_skipped_bytes : 0;
+}
+
+bool clip_gen_depth_external(const struct clip_ctx * ctx) {
+    return ctx && ctx->gen_depth_external;
 }
 
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx) {

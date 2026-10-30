@@ -61,6 +61,9 @@ struct clip_context_params {
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
     bool skip_audio; // BindX: never create the audio context, even if the file has audio tensors
+    bool gen_audio_use_gpu; // BindX: speech-out context backend. Encoders follow use_gpu.
+    // BindX: LFM3 NPU file holds the depthformer. Do not allocate those mmproj tensors.
+    bool skip_gen_depthformer;
 };
 
 struct clip_init_result {
@@ -127,6 +130,11 @@ struct clip_encode_params {
     struct clip_enc_state * enc_state = nullptr;
 };
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
+
+// Audio-gen graphs only. take() clears the record. set_istft() attaches the
+// host waveform time to the record clip_encode() just published.
+bool clip_gen_stage_take(struct mtmd_gen_stage_us * out);
+void clip_gen_stage_set_istft(int64_t istft_us);
 
 // persistent state of a causal audio encoder, for streaming input (one per stream)
 // it holds the sliding window of past keys/values, so each clip_encode() call only takes the new frames

@@ -136,6 +136,14 @@ struct mtmd_context_params {
     // BindX: do not load the audio encoder even when the mmproj carries one (default: false).
     // Skips the gemma4a CLIP init (tensor upload, graph reserve) for callers with no audio input.
     bool skip_audio;
+
+    // BindX: backend for the speech-out context (depthformer + codec). Independent of use_gpu,
+    // which still selects the vision and speech-in encoders. Default true.
+    bool gen_audio_use_gpu;
+
+    // BindX: do not allocate the LFM3 depthformer tensors. An external graph owns them.
+    // The codec and the feedback embedding still load. Default false.
+    bool skip_gen_depthformer;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -545,6 +553,46 @@ MTMD_API int32_t mtmd_gen_audio_process(mtmd_context * ctx,
                                 mtmd_gen_state * state,
                                 const struct mtmd_gen_inp * inp,
                                 struct mtmd_gen_out * out);
+
+// Last audio-generation graph on this thread, in microseconds.
+// kind: 1 = code logits, 2 = feedback embedding, 3 = waveform graph.
+// enq_us is the host submit. gpu_us is the scheduler queue wait that already
+// follows it. read_us is the host copy after that wait. istft_us is host
+// waveform synthesis and is 0 except for kind 3.
+struct mtmd_gen_stage_us {
+    int64_t build_us;
+    int64_t prep_us;
+    int64_t enq_us;
+    int64_t gpu_us;
+    int64_t read_us;
+    int64_t istft_us;
+    int32_t kind;
+};
+
+// Copies the stage and clears it. Returns false when this thread has none.
+MTMD_API bool mtmd_gen_stage_take(struct mtmd_gen_stage_us * out);
+
+// BindX: one MaskGIT depthformer pass on a backend other than the mmproj graph.
+// codes use -1 for a masked codebook. logits are codebook-major, n_codes * (n_logits / n_codes).
+// A null function keeps the mmproj graph.
+typedef bool (*mtmd_lfm3_depth_fn)(
+    const float * hidden, int n_hidden,
+    const int32_t * codes, int n_codes,
+    float * logits, int n_logits,
+    void * user);
+MTMD_API void mtmd_lfm3_set_depth_fn(mtmd_lfm3_depth_fn fn, void * user);
+MTMD_API bool mtmd_lfm3_depth_enabled(void);
+MTMD_API bool mtmd_lfm3_depth(
+    const float * hidden, int n_hidden,
+    const int32_t * codes, int n_codes,
+    float * logits, int n_logits);
+
+// Bytes of LFM3 depthformer tensors left in the mmproj. 0 when those weights were loaded.
+MTMD_API size_t mtmd_gen_depth_skipped_bytes(const struct mtmd_context * ctx);
+// True when this context left the LFM3 depthformer tensors in the file.
+MTMD_API bool mtmd_gen_depth_external(const struct mtmd_context * ctx);
+// Codebook vocab of that external depthformer, or 0 when the mmproj graph is resident.
+MTMD_API int32_t mtmd_lfm3_external_depth_vocab(const struct mtmd_context * ctx);
 
 /////////////////////////////////////////
 

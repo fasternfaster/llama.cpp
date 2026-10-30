@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -14,6 +17,28 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
+static int64_t lfm3_mono_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void lfm3_stage_log(const char * fmt, ...) {
+    char buf[768];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "BindXLlama", "%s", buf);
+#else
+    LOG_INF("%s\n", buf);
+#endif
+}
 
 #ifdef MTMD_INTERNAL_HEADER
 #error "mtmd-helper is a public library outside of mtmd. it must not include internal headers"
@@ -1292,6 +1317,21 @@ public:
         audio_pcm.clear();
         h_state_buf.clear();
         out_buf.clear();
+        stage_frame = 0;
+        stage_legend = false;
+        stage_miss = false;
+        for (auto & s : df_us) s = {};
+        fb_us = {};
+        codec_us = {};
+        istft_us = 0;
+        sum_n = 0;
+        sum_istft = 0;
+        sum_b2 = 0;
+        sum_wall = 0;
+        htp_vocab = 0;
+        for (auto & s : sum_df) s = {};
+        sum_fb = {};
+        sum_codec = {};
     }
 
     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
@@ -1389,6 +1429,9 @@ public:
     // one generate() step: a text token from the caller or an audio frame from the hidden state
     int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) override {
         const bool interleaving = mode == MODE_MIXED;
+        bool timed_audio = false;
+        int64_t wall0 = 0;
+        int64_t b2_0 = 0;
         if (next_is_text()) {
             // <|im_end|> ends the response in any text slot, <|text_end|> outside an interleaved block too
             if (sampled == tok_im_end || (!interleaving && sampled == tok_text_end)) {
@@ -1415,6 +1458,7 @@ public:
                 return 1;
             }
         } else {
+            wall0 = lfm3_mono_us();
             std::vector<int32_t> codes;
             const float * fb = nullptr;
             bool is_eos = false;
@@ -1438,7 +1482,9 @@ public:
                 if (!decode_wav(codes.data(), codes.size())) {
                     return 1;
                 }
+                timed_audio = true;
             }
+            b2_0 = lfm3_mono_us();
             decode_embd_batch batch_embd(const_cast<float *>(fb), 1, 1, n_embd);
             batch_embd.set_position_normal(pos, seq_id);
             batch_embd.logits[0] = 1;
@@ -1458,6 +1504,10 @@ public:
         const float * he = llama_get_embeddings_ith(lctx, -1);
         h_state_buf.assign(he, he + n_embd);
         *h_state_out = h_state_buf.data();
+        if (timed_audio) {
+            const int64_t now = lfm3_mono_us();
+            log_audio_frame(now - b2_0, now - wall0);
+        }
         return 0;
     }
 
@@ -1517,13 +1567,170 @@ public:
             }
             pending_tail = false;
         }
+        log_stage_window();
         return 0;
     }
 
 private:
+    struct stage_us {
+        int64_t build = 0;
+        int64_t prep = 0;
+        int64_t enq = 0;
+        int64_t gpu = 0;
+        int64_t read = 0;
+        int64_t sample = 0;
+        int64_t total() const { return build + prep + enq + gpu + read + sample; }
+        void add(const stage_us & o) {
+            build += o.build; prep += o.prep; enq += o.enq;
+            gpu += o.gpu; read += o.read; sample += o.sample;
+        }
+    };
+
+    static void fmt_stage(char * dst, size_t n, const stage_us & s, int div) {
+        const int d = div > 0 ? div : 1;
+        snprintf(dst, n, "%lld/%lld/%lld/%lld/%lld/%lld",
+            (long long) (s.build / d), (long long) (s.prep / d), (long long) (s.enq / d),
+            (long long) (s.gpu / d), (long long) (s.read / d), (long long) (s.sample / d));
+    }
+
+    bool take_stage(stage_us & out, int64_t * istft, int32_t kind) {
+        mtmd_gen_stage_us got;
+        if (!mtmd_gen_stage_take(&got) || got.kind != kind) {
+            out = {};
+            if (istft) {
+                *istft = 0;
+            }
+            return false;
+        }
+        out.build = got.build_us;
+        out.prep = got.prep_us;
+        out.enq = got.enq_us;
+        out.gpu = got.gpu_us;
+        out.read = got.read_us;
+        out.sample = 0;
+        if (istft) {
+            *istft = got.istft_us;
+        }
+        return true;
+    }
+
+    void note_stage_miss(const char * what) {
+        if (stage_miss) {
+            return;
+        }
+        stage_miss = true;
+        lfm3_stage_log("LFM3_STAGE missing %s split (those clocks stay 0)", what);
+    }
+
+    void log_stage_window() {
+        if (sum_n <= 0) {
+            return;
+        }
+        char df0[96], df1[96], df2[96], fb[96], codec[96];
+        fmt_stage(df0, sizeof(df0), sum_df[0], sum_n);
+        fmt_stage(df1, sizeof(df1), sum_df[1], sum_n);
+        fmt_stage(df2, sizeof(df2), sum_df[2], sum_n);
+        fmt_stage(fb, sizeof(fb), sum_fb, sum_n);
+        fmt_stage(codec, sizeof(codec), sum_codec, sum_n);
+        const int64_t parts = sum_df[0].total() + sum_df[1].total() + sum_df[2].total()
+            + sum_fb.total() + sum_codec.total() + sum_istft + sum_b2;
+        lfm3_stage_log(
+            "LFM3_STAGE_AVG f=%d-%d n=%d df0=%s df1=%s df2=%s fb=%s codec=%s istft=%lld b2=%lld sum=%lld wall=%lld gap=%lld",
+            stage_frame - sum_n + 1, stage_frame, sum_n,
+            df0, df1, df2, fb, codec,
+            (long long) (sum_istft / sum_n), (long long) (sum_b2 / sum_n),
+            (long long) (parts / sum_n), (long long) (sum_wall / sum_n),
+            (long long) ((sum_wall - parts) / sum_n));
+        sum_n = 0;
+        sum_istft = 0;
+        sum_b2 = 0;
+        sum_wall = 0;
+        for (auto & s : sum_df) s = {};
+        sum_fb = {};
+        sum_codec = {};
+    }
+
+    void log_audio_frame(int64_t b2, int64_t wall) {
+        if (!stage_legend) {
+            stage_legend = true;
+            lfm3_stage_log(
+                "LFM3_STAGE units=us cols=build/prep/enq/gpu/read/sample "
+                "build=graph alloc gpu=%s read=host copy after that wait "
+                "enq=host submit prep=input upload istft=host ISTFT b2=2B decode plus hidden-state copy",
+                mtmd_lfm3_depth_enabled() ? "Hexagon depthformer pass" : "scheduler queue wait");
+        }
+        char df0[96], df1[96], df2[96], fb[96], codec[96];
+        fmt_stage(df0, sizeof(df0), df_us[0], 1);
+        fmt_stage(df1, sizeof(df1), df_us[1], 1);
+        fmt_stage(df2, sizeof(df2), df_us[2], 1);
+        fmt_stage(fb, sizeof(fb), fb_us, 1);
+        fmt_stage(codec, sizeof(codec), codec_us, 1);
+        const int64_t parts = df_us[0].total() + df_us[1].total() + df_us[2].total()
+            + fb_us.total() + codec_us.total() + istft_us + b2;
+        stage_frame++;
+        lfm3_stage_log(
+            "LFM3_STAGE f=%d df0=%s df1=%s df2=%s fb=%s codec=%s istft=%lld b2=%lld sum=%lld wall=%lld gap=%lld",
+            stage_frame, df0, df1, df2, fb, codec,
+            (long long) istft_us, (long long) b2,
+            (long long) parts, (long long) wall, (long long) (wall - parts));
+        for (int i = 0; i < 3; i++) {
+            sum_df[i].add(df_us[i]);
+        }
+        sum_fb.add(fb_us);
+        sum_codec.add(codec_us);
+        sum_istft += istft_us;
+        sum_b2 += b2;
+        sum_wall += wall;
+        if (++sum_n == 50) {
+            log_stage_window();
+        }
+    }
+
     // checked by the converter
     static constexpr int   n_cb        = 12;
     static constexpr int   schedule[]  = { 4, 4, 4 }; // codebooks revealed per depthformer pass
+
+    // First MaskGIT pass of the turn. fp16 Hexagon logits have to track the mmproj graph.
+    bool depth_matches(const float * ref, const float * htp, size_t n_vocab) {
+        double dot = 0.0, na = 0.0, nb = 0.0, max_abs = 0.0;
+        int mismatch = 0;
+        for (int cb = 0; cb < n_cb; cb++) {
+            int best_ref = 0, best_htp = 0;
+            float top_ref = -INFINITY, top_htp = -INFINITY;
+            const float * a = ref + (size_t) cb * n_vocab;
+            const float * b = htp + (size_t) cb * n_vocab;
+            for (size_t v = 0; v < n_vocab; v++) {
+                if (!std::isfinite(a[v]) || !std::isfinite(b[v])) {
+                    lfm3_stage_log("LFM3_DEPTH_HTP compare non-finite cb=%d", cb);
+                    return false;
+                }
+                dot += (double) a[v] * (double) b[v];
+                na += (double) a[v] * (double) a[v];
+                nb += (double) b[v] * (double) b[v];
+                max_abs = std::max(max_abs, (double) std::fabs(a[v] - b[v]));
+                if (a[v] > top_ref) {
+                    top_ref = a[v];
+                    best_ref = (int) v;
+                }
+                if (b[v] > top_htp) {
+                    top_htp = b[v];
+                    best_htp = (int) v;
+                }
+            }
+            if (best_ref != best_htp) {
+                mismatch++;
+            }
+        }
+        const double cos = (na > 0.0 && nb > 0.0) ? dot / std::sqrt(na * nb) : 0.0;
+        lfm3_stage_log(
+            "LFM3_DEPTH_HTP compare cos=%.4f maxAbs=%.4f argmax_mismatch=%d vocab=%zu",
+            cos, max_abs, mismatch, n_vocab);
+        if (cos < 0.90) {
+            LOG_ERR("mtmd_helper_gen_audio: Hexagon depthformer diverges from the mmproj graph (cos %.3f)\n", cos);
+            return false;
+        }
+        return true;
+    }
 
     // a random order of the codebooks, revealed by the schedule; fb is the feedback embedding of the codes.
     // at the end of audio every code is the end code, its feedback embedding is only built when continuing
@@ -1543,19 +1750,69 @@ private:
         mtmd_gen_out out{};
 
         int k = 0;
-        for (int n_pick : schedule) {
-            if (mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) != 0 || out.n_feats == 0 || out.n_feats % n_cb != 0) {
-                LOG_ERR("mtmd_helper_gen_audio: depthformer pass failed\n");
+        int pass = 0;
+        const bool use_htp = mtmd_lfm3_depth_enabled();
+        if (use_htp && htp_vocab == 0 && mtmd_gen_depth_external(mctx)) {
+            const int32_t ext = mtmd_lfm3_external_depth_vocab(mctx);
+            if (ext <= 0) {
+                LOG_ERR("mtmd_helper_gen_audio: depthformer weights are not loaded and the codebook vocab is unknown\n");
                 return false;
             }
-            const size_t n_vocab = out.n_feats / n_cb;
-            logits.assign(out.feats, out.feats + out.n_feats);
+            htp_vocab = (size_t) ext;
+            lfm3_stage_log("LFM3_DEPTH_HTP compare skipped mmproj depthformer not resident vocab=%d", ext);
+        }
+        for (int n_pick : schedule) {
+            stage_us got{};
+            size_t n_vocab = htp_vocab;
+            if (!use_htp || htp_vocab == 0) {
+                if (mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) != 0 || out.n_feats == 0 || out.n_feats % n_cb != 0) {
+                    LOG_ERR("mtmd_helper_gen_audio: depthformer pass failed\n");
+                    return false;
+                }
+                if (!take_stage(got, nullptr, 1)) {
+                    note_stage_miss("depthformer");
+                }
+                n_vocab = out.n_feats / (size_t) n_cb;
+                const int64_t t_copy = lfm3_mono_us();
+                logits.assign(out.feats, out.feats + out.n_feats);
+                got.read += lfm3_mono_us() - t_copy;
+                if (use_htp) {
+                    std::vector<float> htp_logits(logits.size());
+                    const int64_t t0 = lfm3_mono_us();
+                    if (!mtmd_lfm3_depth(h_state, n_embd, codes.data(), n_cb, htp_logits.data(), (int) htp_logits.size())) {
+                        LOG_ERR("mtmd_helper_gen_audio: Hexagon depthformer pass failed\n");
+                        return false;
+                    }
+                    const int64_t htp_us = lfm3_mono_us() - t0;
+                    if (!depth_matches(logits.data(), htp_logits.data(), n_vocab)) {
+                        return false;
+                    }
+                    logits.swap(htp_logits);
+                    got = {};
+                    got.gpu = htp_us;
+                    htp_vocab = n_vocab;
+                }
+            } else {
+                logits.resize(htp_vocab * (size_t) n_cb);
+                const int64_t t0 = lfm3_mono_us();
+                if (!mtmd_lfm3_depth(h_state, n_embd, codes.data(), n_cb, logits.data(), (int) logits.size())) {
+                    LOG_ERR("mtmd_helper_gen_audio: Hexagon depthformer pass failed\n");
+                    return false;
+                }
+                got.gpu = lfm3_mono_us() - t0;
+            }
+            const int64_t t_sample = lfm3_mono_us();
             for (int j = 0; j < n_pick; j++, k++) {
                 const int i = order[(size_t) k];
                 float * l = logits.data() + (size_t) i * n_vocab;
                 apply_rep_penalty(l, n_vocab, i);
                 codes[(size_t) i] = sample(l, n_vocab);
             }
+            got.sample = lfm3_mono_us() - t_sample;
+            if (pass < 3) {
+                df_us[pass] = got;
+            }
+            pass++;
         }
 
         // the last code of every codebook ends the audio
@@ -1574,7 +1831,12 @@ private:
             LOG_ERR("mtmd_helper_gen_audio: codebook embedding failed\n");
             return false;
         }
+        if (!take_stage(fb_us, nullptr, 2)) {
+            note_stage_miss("feedback");
+        }
+        const int64_t t_copy = lfm3_mono_us();
         fb_buf.assign(out.embd, out.embd + n_embd);
+        fb_us.read += lfm3_mono_us() - t_copy;
         *fb = fb_buf.data();
         return true;
     }
@@ -1635,6 +1897,9 @@ private:
         if (mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) != 0) {
             LOG_ERR("mtmd_helper_gen_audio: codec decode failed\n");
             return false;
+        }
+        if (n_codes > 0 && !take_stage(codec_us, &istft_us, 3)) {
+            note_stage_miss("codec");
         }
         audio_pcm.insert(audio_pcm.end(), out.audio, out.audio + out.n_samples);
         pending_tail = n_codes > 0;
@@ -1715,6 +1980,22 @@ private:
     bool   stream          = false;
     size_t pcm_sent        = 0;     // samples already returned by get_output()
     bool   wav_header_sent = false;
+
+    size_t htp_vocab = 0; // set after the first Hexagon pass matches the mmproj graph
+    stage_us df_us[3];
+    stage_us fb_us;
+    stage_us codec_us;
+    int64_t istft_us = 0;
+    int stage_frame = 0;
+    bool stage_legend = false;
+    bool stage_miss = false;
+    stage_us sum_df[3];
+    stage_us sum_fb;
+    stage_us sum_codec;
+    int64_t sum_istft = 0;
+    int64_t sum_b2 = 0;
+    int64_t sum_wall = 0;
+    int sum_n = 0;
 };
 
 static std::unique_ptr<mtmd_gen_audio_pipeline> make_pipeline(llama_context * lctx, mtmd_context * mctx) {

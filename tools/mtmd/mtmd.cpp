@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -547,7 +548,9 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
-        /* skip_audio        */ false,
+        /* skip_audio            */ false,
+        /* gen_audio_use_gpu     */ true,
+        /* skip_gen_depthformer  */ false,
     };
     return params;
 }
@@ -655,7 +658,9 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
-            /* skip_audio        */ ctx_params.skip_audio,
+            /* skip_audio            */ ctx_params.skip_audio,
+            /* gen_audio_use_gpu     */ ctx_params.gen_audio_use_gpu,
+            /* skip_gen_depthformer  */ ctx_params.skip_gen_depthformer,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -665,6 +670,13 @@ struct mtmd_context {
         // soprano has no speaker encoder, its mmproj only holds the decoder
         const bool gen_only = ctx_gen_a && clip_get_projector_type(ctx_gen_a) == PROJECTOR_TYPE_SOPRANO;
         if (!ctx_v && !ctx_a && !gen_only) {
+            // The constructor has not finished, so ~mtmd_context will not free these.
+            clip_free(ctx_v);
+            clip_free(ctx_a);
+            clip_free(ctx_gen_a);
+            ctx_v = nullptr;
+            ctx_a = nullptr;
+            ctx_gen_a = nullptr;
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
 
@@ -2402,6 +2414,8 @@ static int32_t mtmd_gen_wav_lfm3a(mtmd_context * ctx, mtmd_gen_state * state, co
         GGML_ASSERT(feats.size() % (2 * (size_t) n_bins) == 0);
         const size_t n_frames = feats.size() / (2 * (size_t) n_bins);
         std::vector<float> spec(2 * (size_t) n_bins);
+        const int64_t t_istft0 = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
         for (size_t f = 0; f < n_frames; f++) {
             const float * fr = feats.data() + f * 2 * n_bins;
             for (int j = 0; j < n_bins; j++) {
@@ -2412,6 +2426,9 @@ static int32_t mtmd_gen_wav_lfm3a(mtmd_context * ctx, mtmd_gen_state * state, co
             const std::vector<float> pcm = state->istft->process_frame(spec.data());
             audio.insert(audio.end(), pcm.begin(), pcm.end());
         }
+        const int64_t t_istft1 = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        clip_gen_stage_set_istft(t_istft1 - t_istft0);
     }
 
     out->audio     = audio.data();
@@ -2551,6 +2568,50 @@ int32_t mtmd_gen_audio_process(mtmd_context * ctx, mtmd_gen_state * state, const
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return 1;
     }
+}
+
+bool mtmd_gen_stage_take(struct mtmd_gen_stage_us * out) {
+    if (out == nullptr) {
+        return false;
+    }
+    return clip_gen_stage_take(out);
+}
+
+static mtmd_lfm3_depth_fn g_lfm3_depth_fn = nullptr;
+static void * g_lfm3_depth_user = nullptr;
+
+void mtmd_lfm3_set_depth_fn(mtmd_lfm3_depth_fn fn, void * user) {
+    g_lfm3_depth_fn = fn;
+    g_lfm3_depth_user = user;
+}
+
+bool mtmd_lfm3_depth_enabled(void) {
+    return g_lfm3_depth_fn != nullptr;
+}
+
+bool mtmd_lfm3_depth(const float * hidden, int n_hidden, const int32_t * codes, int n_codes, float * logits, int n_logits) {
+    if (g_lfm3_depth_fn == nullptr) {
+        return false;
+    }
+    return g_lfm3_depth_fn(hidden, n_hidden, codes, n_codes, logits, n_logits, g_lfm3_depth_user);
+}
+
+size_t mtmd_gen_depth_skipped_bytes(const mtmd_context * ctx) {
+    if (ctx == nullptr || ctx->ctx_gen_a == nullptr) {
+        return 0;
+    }
+    return clip_gen_depth_skipped_bytes(ctx->ctx_gen_a);
+}
+
+bool mtmd_gen_depth_external(const mtmd_context * ctx) {
+    return ctx != nullptr && ctx->ctx_gen_a != nullptr && clip_gen_depth_external(ctx->ctx_gen_a);
+}
+
+int32_t mtmd_lfm3_external_depth_vocab(const mtmd_context * ctx) {
+    if (!mtmd_gen_depth_external(ctx)) {
+        return 0;
+    }
+    return clip_get_hparams(ctx->ctx_gen_a)->gen_code_n_vocab;
 }
 
 mtmd_batch * mtmd_batch_init(mtmd_context * ctx) {

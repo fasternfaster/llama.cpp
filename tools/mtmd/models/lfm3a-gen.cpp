@@ -111,9 +111,10 @@ ggml_tensor * clip_graph_lfm3a_gen::build_lfm_conv(ggml_tensor * cur, const clip
 }
 
 ggml_tensor * clip_graph_lfm3a_gen::build_gen_code() {
-    ggml_tensor * embd_w = model.gen_code_embd_w; // [n_embd, n_vocab, n_codebooks], tied to the output head
-    const int64_t n_cb    = embd_w->ne[2];
-    const int64_t n_vocab = embd_w->ne[1];
+    // Shape is recorded at load. The NPU path does not allocate this tied head.
+    const int64_t n_cb    = hparams.gen_code_n_cb;
+    const int64_t n_vocab = hparams.gen_code_n_vocab;
+    GGML_ASSERT(n_cb > 0 && n_vocab > 0);
 
     // rows of the merged per-codebook tables: code + codebook * n_vocab
     ggml_tensor * inp_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cb);
@@ -128,6 +129,9 @@ ggml_tensor * clip_graph_lfm3a_gen::build_gen_code() {
     if (all_known) {
         return fb;
     }
+
+    ggml_tensor * embd_w = model.gen_code_embd_w; // [n_embd, n_vocab, n_codebooks], tied to the output head
+    GGML_ASSERT(embd_w && "LFM3 depthformer weights were not loaded");
 
     ggml_tensor * h_state = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_mmproj_embd);
     ggml_set_name(h_state, "inp_raw");
@@ -171,7 +175,8 @@ ggml_tensor * clip_graph_lfm3a_gen::build_gen_code() {
 
 ggml_tensor * clip_graph_lfm3a_gen::build_gen_wav() {
     const auto & c2w = model.c2w;
-    const int64_t n_cb   = model.gen_code_embd_w->ne[2];
+    const int64_t n_cb   = hparams.gen_code_n_cb;
+    GGML_ASSERT(n_cb > 0);
     const int64_t n_fs   = hparams.wav_frame_stack;
     const int64_t n_pos  = n_fs * n_frames;
     const int64_t prefix = hparams.wav_tfm_swa - 1;

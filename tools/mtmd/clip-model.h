@@ -202,6 +202,9 @@ struct clip_hparams {
     int32_t wav_dac_n_res        = 0;
     int32_t wav_tfm_swa          = 0; // pre_transformer's KV cache size, in frames
     int32_t wav_frame_stack      = 0; // lfm3a codec: decoder positions per frame
+    // lfm3a depthformer: shape of a.gen.code.embd. Kept when that tensor is not allocated.
+    int32_t gen_code_n_vocab     = 0;
+    int32_t gen_code_n_cb        = 0;
 
     // mimo-v2.5: LLM-side connector (input_local_transformer)
     int32_t audio_local_n_layer = 0;
@@ -978,3 +981,5 @@ struct clip_model {
 };
 
 const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx);
+size_t clip_gen_depth_skipped_bytes(const struct clip_ctx * ctx);
+bool clip_gen_depth_external(const struct clip_ctx * ctx);
